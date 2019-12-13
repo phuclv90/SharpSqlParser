@@ -39,6 +39,7 @@ namespace SqlZerteiler
             RootQueries,
             SelectStatement,
             InsertStatement,
+            DeleteStatement,
             UpdateStatement,
             BinaryExpression,
             FunctionCall,
@@ -76,17 +77,19 @@ namespace SqlZerteiler
         private static readonly Token From = new Token(Token.Type.Keyword, "FROM");
         private static readonly Token Asc = new Token(Token.Type.Keyword, "ASC");
         private static readonly Token Desc = new Token(Token.Type.Keyword, "DESC");
+        private static readonly Token Where = new Token(Token.Type.Keyword, "WHERE");
+        private static readonly Token Group = new Token(Token.Type.Keyword, "GROUP");
+        private static readonly Token Having = new Token(Token.Type.Keyword, "HAVING");
+        private static readonly Token Order = new Token(Token.Type.Keyword, "ORDER");
 
         private static readonly List<Token> FromStopCondition = new List<Token>
         {
-            new Token(Token.Type.Keyword, "WHERE"),
-            new Token(Token.Type.Punctuation, ";"),
+            Where, Group, Having, Order, Semicolon
         };
 
         private static readonly List<Token> GroupByStopCondition = new List<Token>
         {
-            new Token(Token.Type.Keyword, "HAVING"),
-            new Token(Token.Type.Keyword, "ORDER"),
+            Having, Order, Semicolon
         };
 
         private static readonly List<Token> OrderByStopCondition = new List<Token>
@@ -335,7 +338,7 @@ namespace SqlZerteiler
 
             public DeleteNode(SqlNode nameToRemove, SqlNode condition)
             {
-                type = Type.InsertStatement;
+                type = Type.DeleteStatement;
                 this.nameToRemove = nameToRemove;
                 this.condition = condition;
             }
@@ -491,9 +494,9 @@ namespace SqlZerteiler
         /// <summary>Parse delimited list of arguments, column list...</summary>
         /// <param name="start">The start token that starts the list. Pass null
         /// if the start token has already been swallowed</param>
-        /// <param name="skipStop">If true, skip over the stop token, otherwise swallow it</param>
+        /// <param name="consumeStop">If true, skip over the stop token</param>
         private List<SqlNode> ParseDelimitedList(Token start, Token stop, Token separator,
-            Parser parseItem, bool skipStop = true)
+            Parser parseItem, bool consumeStop = true)
         {
             // If start is null then the start delimiter has been consumed and we won't check it
             if (start != null)
@@ -525,14 +528,14 @@ namespace SqlZerteiler
                 var arg = parseItem();
                 argumentList.Add(arg);
             }
-            if (skipStop)
+            if (consumeStop)
                 Skip(stop);
             return argumentList;
         }
 
         /// <summary>Parse delimited list of arguments, column list...</summary>
         private List<SqlNode> ParseDelimitedList(Token start, List<Token> stop,
-            out Token stopToken, Token separator, Parser parseItem)
+            out Token stopToken, Token separator, Parser parseItem, bool consumeStop = false)
         {
             // If start is null then the start delimiter has been consumed and we won't check it
             if (start != null && IsPunctuation(start))
@@ -558,7 +561,10 @@ namespace SqlZerteiler
                     break;
                 argumentList.Add(parseItem());
             }
-            stopToken = tokenizer.Next();
+            if (consumeStop)
+                stopToken = tokenizer.Next();
+            else
+                stopToken = tokenizer.Peek();
             return argumentList;
         }
 
@@ -610,7 +616,7 @@ namespace SqlZerteiler
                     if (token.value.EqualsIgnoreCase("NULL"))
                         return new ValueNode(null, "null");
                     else
-                        goto case default;
+                        goto default;
                 default:
                     throw ReportError("Unexpected token " + token.ToString());
             }
@@ -696,7 +702,26 @@ namespace SqlZerteiler
             }
             else
             {
-                return ParseDelimitedList(null, From, Comma, ParseExpression, skipStop: false);
+                return ParseDelimitedList(null, From, Comma, ParseExpression, consumeStop: false);
+            }
+        }
+
+        private SqlNode ParseOrderList()
+        {
+            var token = tokenizer.Peek();
+            if (token.type != Token.Type.Identifier)
+                throw ReportError("Expecting an identifier. Got " + token.ToString());
+
+            var identifier = new IdentifierNode(token.value);
+            var order = tokenizer.SkipAndPeek();
+            if (order.IsKeyword("ASC") || order.IsKeyword("DESC"))
+            {
+                tokenizer.Next();
+                return new ExpressionNode(identifier, order.value);
+            }
+            else
+            {
+                return identifier;
             }
         }
 
@@ -714,11 +739,11 @@ namespace SqlZerteiler
             var select = ParseSelectList();
 
             List<SqlNode> fromNode = null;
-            Token whereToken = null;
+            Token nextToken = null;
             if (IsKeyword("FROM"))
             {
                 tokenizer.Next();
-                fromNode = ParseDelimitedList(null, FromStopCondition, out whereToken, Comma, ParseIdendifier);
+                fromNode = ParseDelimitedList(null, FromStopCondition, out nextToken, Comma, ParseIdendifier);
             }
             else
             {
@@ -726,13 +751,13 @@ namespace SqlZerteiler
             }
 
             bool statementEnded = false;
-
-            if (whereToken == null || whereToken.IsPunctuation(";"))
+            if (IsPunctuation(";"))
                 statementEnded = true;
 
             SqlNode whereNode = null;
-            if (!statementEnded && whereToken.IsKeyword("WHERE"))
+            if (!statementEnded && IsKeyword("WHERE"))
             {
+                tokenizer.Next();
                 whereNode = ParseExpression();
             }
 
@@ -741,11 +766,12 @@ namespace SqlZerteiler
                 statementEnded = true;
             if (!statementEnded && IsKeyword("GROUP"))
             {
-                var byKeyword = tokenizer.Next();
+                var byKeyword = tokenizer.SkipAndPeek();
                 if (!byKeyword.IsKeyword("BY"))
                 {
                     throw ReportError("Expecting BY keyword. Got " + byKeyword.ToString());
                 }
+                tokenizer.Next();
                 groupByNode = ParseDelimitedList(null, GroupByStopCondition,
                     out Token stopToken, Comma, ParseExpression);
             }
@@ -767,13 +793,15 @@ namespace SqlZerteiler
                 }
                 tokenizer.Next();
                 Token stopToken;
-                orderByNode = ParseDelimitedList(null, OrderByStopCondition, out stopToken, Comma, ParseExpression);
+                orderByNode = ParseDelimitedList(null, OrderByStopCondition, out stopToken, Comma, ParseOrderList);
+                if (stopToken.type == Token.Type.Keyword &&
+                    (stopToken.value.EqualsIgnoreCase("ASC") || stopToken.value.EqualsIgnoreCase("DESC")))
+                    tokenizer.Next();   // not supported asc/desc yet
             }
 
-            if (orderByNode == null)    // ORDER BY has swallowed the `;` token so we don't need to skip
+            if (IsPunctuation(";"))
             {
-                if (!tokenizer.IsEof)
-                    SkipPunctuation(";");
+                SkipPunctuation(";");
             }
             return new SelectNode(select, fromNode, whereNode, groupByNode,
                 havingNode, orderByNode, distinct, null);
